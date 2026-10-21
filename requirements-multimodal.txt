@@ -1,0 +1,13 @@
+-r requirements.txt
+
+# Multimodal backend (--backend st). Install the CUDA build of torch first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+sentence-transformers>=5.0
+transformers>=4.56
+torch>=2.6
+torchvision>=0.21
+pillow>=11.0
+av>=13.0
+soundfile>=0.12
+librosa>=0.10
+torchcodec>=0.7

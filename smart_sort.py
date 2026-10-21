@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """smart_sort.py - organize a folder by what its files are about.
 
-Pipeline: collect files -> extract text -> embed -> cluster -> plan -> move.
+Pipeline: collect files -> extract text or media -> embed -> cluster -> plan -> move.
 
 Safety model
 ------------
@@ -31,7 +31,9 @@ import multiprocessing as mp
 import os
 import re
 import shutil
+import stat
 import sys
+import tempfile
 import time
 import warnings
 from collections import Counter
@@ -77,6 +79,22 @@ DEFAULT_EXCLUDES: tuple[str, ...] = (
     "System Volume Information",
 )
 
+# Files with these suffixes are media handled by multimodal backends.
+MEDIA_SUFFIXES: dict[str, str] = {
+    ".jpg": "image", ".jpeg": "image", ".png": "image", ".webp": "image",
+    ".bmp": "image", ".gif": "image", ".tif": "image", ".tiff": "image",
+    ".heic": "image", ".avif": "image",
+    ".mp3": "audio", ".wav": "audio", ".flac": "audio", ".m4a": "audio",
+    ".ogg": "audio", ".opus": "audio", ".aac": "audio", ".wma": "audio",
+    ".mp4": "video", ".mov": "video", ".mkv": "video", ".avi": "video",
+    ".webm": "video", ".m4v": "video", ".wmv": "video", ".flv": "video",
+}
+
+
+def media_kind(path: Path) -> str | None:
+    return MEDIA_SUFFIXES.get(path.suffix.lower())
+
+
 # --------------------------------------------------------------------------- #
 # Configuration and data types
 # --------------------------------------------------------------------------- #
@@ -90,8 +108,13 @@ class Settings:
     apply: bool = False
     recursive: bool = False
     backend: str = "auto"
-    model_path: Path | None = None
+    model_path: str | None = None
     n_ctx: int = 2048
+    media: tuple[str, ...] = ("image", "audio", "video")
+    device: str = "auto"
+    dtype: str = "auto"
+    batch_size: int = 32
+    text_prompt: str | None = None
     max_chars: int = 4000
     max_chunks: int = 4
     max_pdf_pages: int = 20
@@ -110,6 +133,7 @@ class Document:
     path: Path
     text: str
     chunks: list[str]
+    kind: str = "text"
 
 
 @dataclass
@@ -183,6 +207,29 @@ def _skip_dir(name: str, excludes: Sequence[str]) -> bool:
     return _matches_any(name, excludes)
 
 
+_WINDOWS_HIDDEN_MASK = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0x2) | getattr(
+    stat, "FILE_ATTRIBUTE_SYSTEM", 0x4
+)
+
+
+def is_hidden_or_system(path: Path) -> bool:
+    """True for Office lock files and hidden/system entries.
+
+    Windows uses file attributes, so a leading dot is *not* treated as hidden
+    there (e.g. ``.NET Consultant notes.docx`` is a real document). On POSIX
+    systems the dot prefix convention applies.
+    """
+    if path.name.startswith("~$"):
+        return True
+    if os.name != "nt":
+        return path.name.startswith(".")
+    try:
+        attributes = path.stat().st_file_attributes
+    except OSError:
+        return True
+    return bool(attributes & _WINDOWS_HIDDEN_MASK)
+
+
 def collect_files(
     root: Path,
     recursive: bool = False,
@@ -192,7 +239,7 @@ def collect_files(
     files: list[Path] = []
 
     def consider(path: Path) -> None:
-        if path.is_symlink() or not path.is_file() or path.name.startswith("."):
+        if path.is_symlink() or not path.is_file() or is_hidden_or_system(path):
             return
         if _matches_any(path.name, excludes):
             return
@@ -203,7 +250,9 @@ def collect_files(
             dirnames[:] = sorted(
                 d
                 for d in dirnames
-                if not _skip_dir(d, excludes) and not (Path(dirpath) / d).is_symlink()
+                if not _skip_dir(d, excludes)
+                and not is_hidden_or_system(Path(dirpath) / d)
+                and not (Path(dirpath) / d).is_symlink()
             )
             for name in sorted(filenames):
                 consider(Path(dirpath) / name)
@@ -240,7 +289,7 @@ def split_chunks(text: str, max_chars: int, max_chunks: int) -> list[str]:
     return [text[start : start + max_chars] for start in sorted(starts)]
 
 
-_PDF_BYTES_PER_SECOND = 2 * 1024 * 1024
+_PDF_BYTES_PER_SECOND = 30 * 1024 * 1024
 _DOCX_BYTES_PER_SECOND = 10 * 1024 * 1024
 _PARALLEL_THRESHOLD_SECONDS = 0.75
 
@@ -291,9 +340,11 @@ def load_documents(
     max_pdf_pages: int,
     min_chars: int,
     jobs: int | None = None,
+    media_kinds: Sequence[str] = (),
 ) -> tuple[list[Document], list[Skip]]:
     documents: list[Document] = []
     skipped: list[Skip] = []
+    media_set = set(media_kinds)
 
     extracted: dict[Path, tuple[str | None, str | None]] = {}
     heavy = [path for path in files if is_heavy(path)]
@@ -307,6 +358,14 @@ def load_documents(
             extracted = {}
 
     for path in files:
+        kind = media_kind(path)
+        if kind is not None:
+            if kind in media_set:
+                documents.append(Document(path, "", [], kind))
+            else:
+                skipped.append(Skip(path, f"{kind} embedding not enabled"))
+            continue
+
         outcome = extracted.get(path)
         if outcome is None:
             outcome = extract_worker((str(path), max_pdf_pages))
@@ -334,8 +393,11 @@ def load_documents(
 class Embedder(Protocol):
     name: str
     cacheable: bool
+    media_kinds: frozenset[str]
 
     def embed_corpus(self, texts: Sequence[str]) -> np.ndarray: ...
+
+    def embed_media(self, items: Sequence[tuple[Path, str]]) -> np.ndarray: ...
 
 
 class EmbedderError(Exception):
@@ -361,10 +423,14 @@ class TfidfEmbedder:
     """
 
     cacheable = False
+    media_kinds: frozenset[str] = frozenset()
 
     def __init__(self, max_features: int = 20000) -> None:
         self.name = "tfidf"
         self._max_features = max_features
+
+    def embed_media(self, items: Sequence[tuple[Path, str]]) -> np.ndarray:
+        raise NotImplementedError("the TF-IDF backend cannot embed media")
 
     def embed_corpus(self, texts: Sequence[str]) -> np.ndarray:
         if not texts:
@@ -390,6 +456,7 @@ class LlamaEmbedder:
     """Local GGUF embedding model through llama-cpp-python."""
 
     cacheable = True
+    media_kinds: frozenset[str] = frozenset()
 
     def __init__(self, model_path: Path, n_ctx: int = 2048) -> None:
         try:
@@ -432,13 +499,184 @@ class LlamaEmbedder:
             return np.zeros((0, 1), dtype=np.float32)
         return _l2_normalize(np.asarray(vectors, dtype=np.float32))
 
+    def embed_media(self, items: Sequence[tuple[Path, str]]) -> np.ndarray:
+        raise NotImplementedError("the GGUF text backend cannot embed media")
+
+
+def _prepare_windows_ffmpeg() -> None:
+    """Make FFmpeg shared libraries visible to TorchCodec on Windows.
+
+    TorchCodec requires FFmpeg DLLs; PyAV already ships them. Copy PyAV's
+    libraries to a cache directory under the unhashed names TorchCodec looks
+    for, once per PyAV version, then expose that directory.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import av
+    except ImportError:
+        return
+
+    bundled = Path(av.__file__).parent.parent / "av.libs"
+    if not bundled.is_dir():
+        return
+
+    cache_root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+    target = cache_root / "smart-sort" / f"ffmpeg-{av.__version__}"
+    marker = target / ".ready"
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    if marker.exists() and str(target) in path_entries:
+        return
+
+    if not marker.exists():
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            for dll in bundled.glob("*.dll"):
+                shutil.copy2(dll, target / dll.name)
+                match = re.match(r"^(.+?-\d+)-[0-9a-f]{32}\.dll$", dll.name)
+                if match:
+                    shutil.copy2(dll, target / f"{match.group(1)}.dll")
+            dummy = target / "ffmpeg.exe"
+            if not dummy.exists():
+                dummy.write_bytes(b"MZ")
+            marker.write_text("ok", encoding="utf-8")
+        except OSError as exc:
+            LOG.warning("Could not prepare FFmpeg libraries: %s", exc)
+            return
+
+    if str(target) not in path_entries:
+        os.environ["PATH"] = str(target) + os.pathsep + os.environ.get("PATH", "")
+    add_dll_directory = getattr(os, "add_dll_directory", None)
+    if add_dll_directory is not None:
+        try:
+            add_dll_directory(str(target))
+        except OSError:
+            pass
+    LOG.debug("Exposed PyAV FFmpeg libraries from %s", target)
+
+
+class SentenceTransformerEmbedder:
+    """Multimodal backend (EmbeddingGemma 2) via sentence-transformers.
+
+    Text, images, audio, and video share one vector space, so a photo of an
+    invoice and an invoice PDF can land in the same cluster.
+    """
+
+    cacheable = True
+
+    def __init__(
+        self,
+        model_name: str,
+        device: str = "auto",
+        dtype: str = "auto",
+        batch_size: int = 32,
+        text_prompt: str | None = None,
+        media: Sequence[str] = ("image", "audio", "video"),
+    ) -> None:
+        _prepare_windows_ffmpeg()
+        try:
+            import torch
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:  # pragma: no cover - depends on environment
+            raise EmbedderError(
+                "sentence-transformers is not installed. Run "
+                "`pip install -r requirements-multimodal.txt`."
+            ) from exc
+
+        resolved_device = device
+        if device == "auto":
+            resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        if dtype == "auto":
+            resolved_dtype = (
+                torch.bfloat16 if resolved_device.startswith("cuda") else torch.float32
+            )
+        else:
+            dtypes = {
+                "bf16": torch.bfloat16,
+                "bfloat16": torch.bfloat16,
+                "fp16": torch.float16,
+                "float16": torch.float16,
+                "fp32": torch.float32,
+                "float32": torch.float32,
+            }
+            if dtype not in dtypes:
+                raise EmbedderError(f"Unsupported dtype: {dtype}")
+            resolved_dtype = dtypes[dtype]
+        if resolved_dtype == torch.float16:
+            LOG.warning("EmbeddingGemma 2 returns NaN in fp16; prefer bf16 or fp32.")
+
+        try:
+            self._model = SentenceTransformer(
+                model_name,
+                device=resolved_device,
+                model_kwargs={"torch_dtype": resolved_dtype},
+            )
+        except Exception as exc:  # pragma: no cover - depends on model files
+            raise EmbedderError(f"Failed to load {model_name}: {exc}") from exc
+
+        prompts = getattr(self._model, "prompts", None) or {}
+        self._prompt_name = text_prompt if text_prompt in prompts else None
+        if text_prompt and self._prompt_name is None:
+            LOG.warning(
+                "Prompt %r is not defined by %s; encoding text without a prompt.",
+                text_prompt,
+                model_name,
+            )
+        elif self._prompt_name is None and "Document" in prompts:
+            self._prompt_name = "Document"
+
+        self._batch_size = max(1, batch_size)
+        self.media_kinds = frozenset(media)
+        dtype_name = str(resolved_dtype).replace("torch.", "")
+        prompt_name = self._prompt_name or "none"
+        self.name = f"st:{model_name}:{resolved_device}:{dtype_name}:{prompt_name}"
+
+    def _encode(self, inputs, **kwargs) -> np.ndarray:
+        vectors = self._model.encode(
+            inputs,
+            batch_size=self._batch_size,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            **kwargs,
+        )
+        return np.asarray(vectors, dtype=np.float32)
+
+    def embed_corpus(self, texts: Sequence[str]) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, 1), dtype=np.float32)
+        kwargs = {"prompt_name": self._prompt_name} if self._prompt_name else {}
+        return _l2_normalize(self._encode(list(texts), **kwargs))
+
+    def embed_media(self, items: Sequence[tuple[Path, str]]) -> np.ndarray:
+        if not items:
+            return np.zeros((0, 1), dtype=np.float32)
+        payload = []
+        for path, kind in items:
+            if kind == "image":
+                payload.append({"text": "<|image|>", "image": [str(path)]})
+            else:
+                payload.append({"text": f"<|{kind}|>", kind: str(path)})
+        return _l2_normalize(self._encode(payload))
+
 
 def build_embedder(settings: Settings) -> Embedder:
     if settings.backend == "tfidf":
         LOG.info("Using the TF-IDF backend (no model required).")
         return TfidfEmbedder()
 
-    candidate = settings.model_path
+    if settings.backend == "st":
+        return SentenceTransformerEmbedder(
+            settings.model_path or "unsloth/embeddinggemma-2",
+            device=settings.device,
+            dtype=settings.dtype,
+            batch_size=settings.batch_size,
+            text_prompt=settings.text_prompt,
+            media=settings.media,
+        )
+
+    candidate = Path(settings.model_path) if settings.model_path else None
     if settings.backend == "gguf":
         if candidate is None:
             raise EmbedderError("--backend gguf requires --model PATH.")
@@ -510,18 +748,71 @@ class EmbeddingCache:
         os.replace(temporary, self.path)
 
 
+def _media_cache_key(path: Path, kind: str) -> str:
+    try:
+        stats = path.stat()
+        return f"media:{kind}:{path.as_posix()}:{stats.st_size}:{stats.st_mtime_ns}"
+    except OSError:
+        return f"media:{kind}:{path.as_posix()}"
+
+
+def _embed_media_with_fallback(
+    embedder: Embedder, items: Sequence[tuple[Path, str]], batch_size: int = 8
+) -> tuple[dict[Path, np.ndarray], list[Path]]:
+    """Embed media in batches, retrying failures individually to isolate bad files."""
+    embedded: dict[Path, np.ndarray] = {}
+    failed: list[Path] = []
+
+    for start in range(0, len(items), batch_size):
+        batch = list(items[start : start + batch_size])
+        try:
+            fresh = embedder.embed_media(batch)
+            if len(fresh) != len(batch):
+                raise RuntimeError(
+                    f"embedder returned {len(fresh)} vectors for {len(batch)} media items"
+                )
+            for (path, _kind), vector in zip(batch, fresh):
+                embedded[path] = np.asarray(vector, dtype=np.float32)
+            continue
+        except Exception as exc:
+            LOG.warning("Media batch failed (%s); retrying individually.", exc)
+
+        for item in batch:
+            try:
+                single = embedder.embed_media([item])
+                if len(single) != 1:
+                    raise RuntimeError("embedder returned an unexpected vector count")
+                embedded[item[0]] = np.asarray(single[0], dtype=np.float32)
+            except Exception as exc:
+                failed.append(item[0])
+                LOG.warning("Cannot embed %s: %s", item[0].name, exc)
+
+    return embedded, failed
+
+
 def embed_documents(
     documents: Sequence[Document],
     embedder: Embedder,
     cache_dir: Path | None = None,
     use_cache: bool = True,
-) -> np.ndarray:
-    """Embed every unique chunk once, then mean-pool per document."""
+) -> tuple[np.ndarray, list[Document], list[Skip]]:
+    """Embed text and media, returning the matrix and the documents that succeeded."""
+    cache = None
+    if cache_dir is not None and use_cache and embedder.cacheable:
+        cache_path = cache_dir / f"embeddings-{_slug(embedder.name)}.npz"
+        cache = EmbeddingCache(cache_path, {"embedder": embedder.name})
+
+    vectors: dict[int, np.ndarray] = {}
+    failures: dict[int, str] = {}
+
+    # ---- text chunks ------------------------------------------------------ #
     chunk_positions: dict[str, int] = {}
     chunk_texts: list[str] = []
-    document_chunks: list[list[int]] = []
+    document_chunks: dict[int, list[int]] = {}
 
-    for document in documents:
+    for index, document in enumerate(documents):
+        if document.kind != "text":
+            continue
         positions: list[int] = []
         for chunk in document.chunks:
             key = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
@@ -531,59 +822,113 @@ def embed_documents(
                 chunk_positions[key] = position
                 chunk_texts.append(chunk)
             positions.append(position)
-        document_chunks.append(positions)
-
-    cache = None
-    if cache_dir is not None and use_cache and embedder.cacheable:
-        cache_path = cache_dir / f"embeddings-{_slug(embedder.name)}.npz"
-        cache = EmbeddingCache(cache_path, {"embedder": embedder.name})
+        document_chunks[index] = positions
 
     keys = list(chunk_positions)
-    vectors: list[np.ndarray | None] = [None] * len(keys)
-    missing: list[int] = []
+    chunk_vectors: list[np.ndarray | None] = [None] * len(keys)
+    missing_chunks: list[int] = []
     for index, key in enumerate(keys):
         cached = cache.get(key) if cache else None
         if cached is None:
-            missing.append(index)
+            missing_chunks.append(index)
         else:
-            vectors[index] = cached
+            chunk_vectors[index] = cached
 
-    if missing:
+    if missing_chunks:
         LOG.info(
-            "Embedding %d chunks (%d cached)", len(missing), len(keys) - len(missing)
+            "Embedding %d chunks (%d cached)",
+            len(missing_chunks),
+            len(keys) - len(missing_chunks),
         )
-        fresh = embedder.embed_corpus([chunk_texts[index] for index in missing])
-        if len(fresh) != len(missing):
+        fresh = embedder.embed_corpus([chunk_texts[index] for index in missing_chunks])
+        if len(fresh) != len(missing_chunks):
             raise RuntimeError(
-                f"Embedder returned {len(fresh)} vectors for {len(missing)} chunks"
+                f"Embedder returned {len(fresh)} vectors for {len(missing_chunks)} chunks"
             )
-        for index, vector in zip(missing, fresh):
-            vectors[index] = np.asarray(vector, dtype=np.float32)
+        for index, vector in zip(missing_chunks, fresh):
+            chunk_vectors[index] = np.asarray(vector, dtype=np.float32)
             if cache:
-                cache.put(keys[index], vectors[index])
+                cache.put(keys[index], chunk_vectors[index])
         if cache:
             cache.save()
     elif keys:
         LOG.info("All %d chunks loaded from cache", len(keys))
 
-    dims = {vector.shape[0] for vector in vectors if vector is not None}
+    for index, positions in document_chunks.items():
+        if positions:
+            vectors[index] = np.mean([chunk_vectors[p] for p in positions], axis=0)
+        else:
+            failures[index] = "no text chunks"
+
+    # ---- media ------------------------------------------------------------ #
+    media_indices = [index for index, doc in enumerate(documents) if doc.kind != "text"]
+    missing_media: list[tuple[int, str]] = []
+    for index in media_indices:
+        document = documents[index]
+        key = _media_cache_key(document.path, document.kind)
+        cached = cache.get(key) if cache else None
+        if cached is None:
+            missing_media.append((index, key))
+        else:
+            vectors[index] = cached
+
+    if missing_media:
+        if not embedder.media_kinds:
+            for index, _key in missing_media:
+                failures[index] = "media not supported by this backend"
+        else:
+            items_by_kind: dict[str, list[tuple[Path, str]]] = {}
+            for index, _key in missing_media:
+                document = documents[index]
+                items_by_kind.setdefault(document.kind, []).append(
+                    (document.path, document.kind)
+                )
+
+            embedded: dict[Path, np.ndarray] = {}
+            failed_paths: list[Path] = []
+            for kind, items in items_by_kind.items():
+                LOG.info("Embedding %d %s files", len(items), kind)
+                kind_vectors, kind_failures = _embed_media_with_fallback(embedder, items)
+                embedded.update(kind_vectors)
+                failed_paths.extend(kind_failures)
+
+            failed_set = set(failed_paths)
+            for index, key in missing_media:
+                document = documents[index]
+                if document.path in failed_set:
+                    failures[index] = f"{document.kind} could not be decoded"
+                    continue
+                vectors[index] = embedded[document.path]
+                if cache:
+                    cache.put(key, vectors[index])
+            if cache:
+                cache.save()
+    elif media_indices:
+        LOG.info("All %d media files loaded from cache", len(media_indices))
+
+    # ---- assemble --------------------------------------------------------- #
+    dims = {vector.shape[0] for vector in vectors.values()}
     if len(dims) > 1:
         raise RuntimeError(f"Inconsistent embedding dimensions: {sorted(dims)}")
     dimension = dims.pop() if dims else 1
 
-    matrix = np.zeros((len(keys), dimension), dtype=np.float32)
-    for index, vector in enumerate(vectors):
-        if vector is not None:
-            matrix[index] = vector
+    kept: list[Document] = []
+    skipped: list[Skip] = []
+    rows: list[np.ndarray] = []
+    for index, document in enumerate(documents):
+        if index in failures:
+            skipped.append(Skip(document.path, failures[index]))
+            continue
+        vector = vectors.get(index)
+        if vector is None:
+            skipped.append(Skip(document.path, "no embedding produced"))
+            continue
+        kept.append(document)
+        rows.append(vector)
 
-    if not documents:
-        return np.zeros((0, dimension), dtype=np.float32)
-
-    pooled = np.zeros((len(documents), dimension), dtype=np.float32)
-    for index, positions in enumerate(document_chunks):
-        if positions:
-            pooled[index] = matrix[positions].mean(axis=0)
-    return _l2_normalize(pooled)
+    if not rows:
+        return np.zeros((0, dimension), dtype=np.float32), kept, skipped
+    return _l2_normalize(np.vstack(rows)), kept, skipped
 
 
 # --------------------------------------------------------------------------- #
@@ -671,6 +1016,68 @@ def build_cluster_names(documents: Sequence[Document], labels: np.ndarray) -> di
             name = f"{name}_{cluster + 1}"
         used.add(name.casefold())
         names[cluster] = name
+    return names
+
+
+MEDIA_LABELS: tuple[str, ...] = (
+    "photographs",
+    "screenshots",
+    "scanned documents",
+    "receipts",
+    "invoices",
+    "presentations",
+    "spreadsheets",
+    "charts and diagrams",
+    "maps",
+    "logos and icons",
+    "wallpapers",
+    "social media images",
+    "memes",
+    "product photos",
+    "people and portraits",
+    "landscapes",
+    "food",
+    "buildings",
+    "artwork",
+    "music",
+    "speech recordings",
+    "podcasts",
+    "videos",
+    "screen recordings",
+    "movies and clips",
+)
+
+
+def label_media_clusters(
+    documents: Sequence[Document],
+    labels: np.ndarray,
+    matrix: np.ndarray,
+    embedder: Embedder,
+    names: dict[int, str],
+) -> dict[int, str]:
+    """Name media-only clusters by nearest text label in the shared space."""
+    if not getattr(embedder, "media_kinds", frozenset()) or not len(labels):
+        return names
+
+    has_text = {int(label): False for label in np.unique(labels)}
+    for document, label in zip(documents, labels):
+        if document.kind == "text" and document.text:
+            has_text[int(label)] = True
+    media_clusters = [cluster for cluster, present in has_text.items() if not present]
+    if not media_clusters:
+        return names
+
+    try:
+        label_vectors = _l2_normalize(embedder.embed_corpus(list(MEDIA_LABELS)))
+    except Exception as exc:  # pragma: no cover - depends on backend
+        LOG.debug("Media cluster naming unavailable: %s", exc)
+        return names
+
+    for cluster in media_clusters:
+        centroid = matrix[labels == cluster].mean(axis=0)
+        centroid = _l2_normalize(centroid.reshape(1, -1))[0]
+        best = int(np.argmax(label_vectors @ centroid))
+        names[cluster] = f"Cluster_{cluster + 1}_{_slug(MEDIA_LABELS[best])}"
     return names
 
 
@@ -891,6 +1298,16 @@ def run(settings: Settings, embedder: Embedder | None = None) -> int:
         LOG.error("No eligible files found in %s", root)
         return 1
 
+    try:
+        with watch.phase("model"):
+            embedder = embedder or build_embedder(settings)
+    except EmbedderError as exc:
+        LOG.error("%s", exc)
+        return 1
+
+    media_kinds = tuple(
+        kind for kind in settings.media if kind in getattr(embedder, "media_kinds", frozenset())
+    )
     with watch.phase("extract"):
         documents, skipped = load_documents(
             files,
@@ -899,30 +1316,28 @@ def run(settings: Settings, embedder: Embedder | None = None) -> int:
             settings.max_pdf_pages,
             settings.min_chars,
             settings.jobs,
+            media_kinds,
         )
+
+    cache_dir = root / STATE_DIR if settings.use_cache else None
+    try:
+        with watch.phase("embed"):
+            matrix, documents, media_skips = embed_documents(
+                documents, embedder, cache_dir, settings.use_cache
+            )
+            skipped.extend(media_skips)
+    except (RuntimeError, ValueError) as exc:
+        LOG.error("Embedding failed: %s", exc)
+        return 1
 
     if len(documents) < 2:
         LOG.error(
-            "Need at least 2 readable files, found %d (skipped %d).",
+            "Need at least 2 embeddable files, found %d (skipped %d).",
             len(documents),
             len(skipped),
         )
         for skip in skipped:
             LOG.info("Skipped %s: %s", skip.path.name, skip.reason)
-        return 1
-
-    try:
-        embedder = embedder or build_embedder(settings)
-    except EmbedderError as exc:
-        LOG.error("%s", exc)
-        return 1
-
-    cache_dir = root / STATE_DIR if settings.use_cache else None
-    try:
-        with watch.phase("embed"):
-            matrix = embed_documents(documents, embedder, cache_dir, settings.use_cache)
-    except (RuntimeError, ValueError) as exc:
-        LOG.error("Embedding failed: %s", exc)
         return 1
 
     with watch.phase("cluster"):
@@ -940,6 +1355,8 @@ def run(settings: Settings, embedder: Embedder | None = None) -> int:
             if settings.label_clusters
             else {int(label): f"Cluster_{int(label) + 1}" for label in np.unique(labels)}
         )
+        if settings.label_clusters:
+            names = label_media_clusters(documents, labels, matrix, embedder, names)
         moves = plan_moves(root, documents, labels, names)
 
     _print_summary(root, moves, settings)
@@ -965,6 +1382,7 @@ def run(settings: Settings, embedder: Embedder | None = None) -> int:
                 "backend": embedder.name,
                 "k": k,
                 "files": len(documents),
+                "media": ",".join(media_kinds),
                 "seed": settings.seed,
             },
         )
@@ -999,6 +1417,7 @@ def build_parser() -> argparse.ArgumentParser:
             '  smart_sort.py "D:\\Downloads"                     # preview (safe)\n'
             '  smart_sort.py "D:\\Downloads" --apply             # reorganize\n'
             '  smart_sort.py . --backend tfidf --k 6 --recursive\n'
+            '  smart_sort.py "D:\\Media" --backend st --model unsloth/embeddinggemma-2\n'
             '  smart_sort.py --model models/embeddinggemma-2.gguf --apply "D:\\Docs"\n'
             '  smart_sort.py --undo ".smart_sort/manifest-20250101-120000.jsonl" --apply\n'
         ),
@@ -1025,11 +1444,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--backend",
-        choices=("auto", "gguf", "tfidf"),
+        choices=("auto", "gguf", "tfidf", "st"),
         default="auto",
-        help="Embedding backend: GGUF model, TF-IDF fallback, or auto-detect (default).",
+        help=(
+            "Embedding backend: st = sentence-transformers (multimodal "
+            "EmbeddingGemma 2), gguf = llama.cpp text model, tfidf = no model, "
+            "auto = GGUF if present else TF-IDF."
+        ),
     )
-    parser.add_argument("--model", type=Path, help="Path to a GGUF embedding model.")
+    parser.add_argument(
+        "--model",
+        type=str,
+        help=(
+            "GGUF file path (gguf backend) or Hugging Face id / local path "
+            "(st backend, default: unsloth/embeddinggemma-2)."
+        ),
+    )
+    parser.add_argument(
+        "--media",
+        default="image,audio,video",
+        help="Media kinds to embed with the st backend (default: image,audio,video).",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Device for the st backend: auto, cpu, cuda, cuda:0 (default: auto).",
+    )
+    parser.add_argument(
+        "--dtype",
+        default="auto",
+        help="Model dtype for the st backend: auto, bf16, fp32 (default: auto).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size for the st backend (default: 32).",
+    )
+    parser.add_argument(
+        "--text-prompt",
+        default=None,
+        help="Task prompt name for text embeddings (e.g. Document, SearchQuery).",
+    )
     parser.add_argument(
         "--n-ctx", type=int, default=2048, help="Context size for the GGUF model."
     )
@@ -1094,7 +1550,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_output_streams() -> None:
+    """Never crash printing names the console encoding cannot represent."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="backslashreplace")
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _configure_output_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -1102,6 +1571,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(message)s",
     )
+    for noisy in (
+        "pypdf",
+        "PyPDF2",
+        "httpx",
+        "huggingface_hub",
+        "filelock",
+        "urllib3",
+        "sentence_transformers",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     if args.undo:
         manifest = Path(args.undo).expanduser()
@@ -1132,6 +1611,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not root.is_dir():
         parser.error(f"not a directory: {root}")
 
+    media = tuple(part.strip().lower() for part in args.media.split(",") if part.strip())
+    unknown_media = set(media) - {"image", "audio", "video"}
+    if unknown_media:
+        parser.error(f"unknown media kinds: {', '.join(sorted(unknown_media))}")
+
     settings = Settings(
         root=root,
         k=args.k,
@@ -1141,6 +1625,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         backend=args.backend,
         model_path=args.model,
         n_ctx=args.n_ctx,
+        media=media,
+        device=args.device,
+        dtype=args.dtype,
+        batch_size=args.batch_size,
+        text_prompt=args.text_prompt,
         max_chars=args.max_chars,
         max_chunks=args.max_chunks,
         max_pdf_pages=args.max_pdf_pages,

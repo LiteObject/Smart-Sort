@@ -7,6 +7,7 @@ parallel PDF/DOCX extraction do not pay the numpy/scikit-learn import cost.
 from __future__ import annotations
 
 import codecs
+import os
 from pathlib import Path
 
 # Files parsed by a real parser rather than a plain read; these are CPU-bound
@@ -67,14 +68,43 @@ def _read_text_file(path: Path) -> str:
     return _decode_bytes(data)
 
 
-def _extract_pdf(path: Path, max_pages: int) -> str:
+def _extract_pdf_pdfium(path: Path, max_pages: int) -> str:
+    """Fast path: PDFium (pypdfium2) is a C++ engine."""
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(str(path))
+    try:
+        page_count = min(len(document), max_pages)
+        parts: list[str] = []
+        for index in range(page_count):
+            try:
+                page = document[index]
+            except Exception:
+                continue
+            try:
+                textpage = page.get_textpage()
+            except Exception:
+                page.close()
+                continue
+            try:
+                parts.append(textpage.get_text_range())
+            finally:
+                textpage.close()
+                page.close()
+        return "\n".join(parts)
+    finally:
+        document.close()
+
+
+def _extract_pdf_legacy(path: Path, max_pages: int) -> str:
+    """Fallback: pure-Python pypdf/PyPDF2."""
     try:
         from pypdf import PdfReader
     except ImportError:  # pragma: no cover - depends on environment
         try:
             from PyPDF2 import PdfReader  # type: ignore[no-redef]
         except ImportError as exc:
-            raise ExtractionError("install pypdf to read PDFs") from exc
+            raise ExtractionError("install pypdfium2 or pypdf to read PDFs") from exc
 
     try:
         reader = PdfReader(str(path))
@@ -88,6 +118,21 @@ def _extract_pdf(path: Path, max_pages: int) -> str:
         except Exception:
             continue
     return "\n".join(pages)
+
+
+def _extract_pdf(path: Path, max_pages: int) -> str:
+    if os.environ.get("SMART_SORT_PDF_ENGINE", "").strip().lower() == "legacy":
+        return _extract_pdf_legacy(path, max_pages)
+
+    try:
+        import pypdfium2  # noqa: F401
+    except ImportError:  # pragma: no cover - depends on environment
+        return _extract_pdf_legacy(path, max_pages)
+
+    try:
+        return _extract_pdf_pdfium(path, max_pages)
+    except Exception as exc:
+        raise ExtractionError(f"read error ({type(exc).__name__})") from exc
 
 
 def _extract_docx(path: Path) -> str:
