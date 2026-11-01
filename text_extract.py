@@ -38,6 +38,8 @@ def is_heavy(path: Path) -> bool:
 
 
 def _decode_bytes(data: bytes) -> str:
+    if data.startswith(codecs.BOM_UTF32_LE) or data.startswith(codecs.BOM_UTF32_BE):
+        return data.decode("utf-32")
     if data.startswith(codecs.BOM_UTF16_LE) or data.startswith(codecs.BOM_UTF16_BE):
         return data.decode("utf-16")
     for encoding in ("utf-8-sig", "cp1252"):
@@ -52,19 +54,35 @@ def looks_like_text(data: bytes) -> bool:
     if not data:
         return True
     sample = data[:8192]
-    if b"\x00" in sample and not (
-        sample.startswith(codecs.BOM_UTF16_LE) or sample.startswith(codecs.BOM_UTF16_BE)
-    ):
+    if sample.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        encoding = "utf-32"
+    elif sample.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encoding = "utf-16"
+    elif b"\x00" in sample:
         return False
-    text = sample.decode("latin-1")
+    else:
+        encoding = "utf-8-sig"
+    try:
+        text = codecs.getincrementaldecoder(encoding)(errors="strict").decode(sample, final=False)
+    except UnicodeDecodeError:
+        if encoding != "utf-8-sig":
+            return False
+        try:
+            text = sample.decode("cp1252")
+        except UnicodeDecodeError:
+            text = sample.decode("latin-1")
+    if not text:
+        return True
     printable = sum(1 for ch in text if ch.isprintable() or ch in "\r\n\t")
     return printable / len(text) >= 0.9
 
 
 def _read_text_file(path: Path) -> str:
-    data = path.read_bytes()
-    if not looks_like_text(data[:8192]):
-        raise ExtractionError("binary or unsupported format")
+    with path.open("rb") as handle:
+        sample = handle.read(8192)
+        if not looks_like_text(sample):
+            raise ExtractionError("binary or unsupported format")
+        data = sample + handle.read()
     return _decode_bytes(data)
 
 
@@ -164,7 +182,8 @@ def extract_text(path: Path, max_pdf_pages: int = 20) -> str:
         return _read_text_file(path)
 
     # Unknown extension: accept it only when the content is clearly text.
-    data = path.read_bytes()[:8192]
+    with path.open("rb") as handle:
+        data = handle.read(8192)
     if looks_like_text(data):
         return _read_text_file(path)
     raise ExtractionError("binary or unsupported format")

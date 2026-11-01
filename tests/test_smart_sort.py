@@ -152,19 +152,20 @@ class SmartSortTestCase(unittest.TestCase):
         self.write("sub/nested.txt", "nested content")
         self.write("server.log", "log line")
 
+        dotfiles = [".NET Consultant notes.docx"] if os.name == "nt" else []
         top_level = ss.collect_files(self.root)
         self.assertEqual(
             [p.name for p in top_level],
-            [".NET Consultant notes.docx", "server.log", "top.txt"],
+            dotfiles + ["server.log", "top.txt"],
         )
 
         filtered = ss.collect_files(self.root, excludes=ss.DEFAULT_EXCLUDES + ("*.log",))
-        self.assertEqual([p.name for p in filtered], [".NET Consultant notes.docx", "top.txt"])
+        self.assertEqual([p.name for p in filtered], dotfiles + ["top.txt"])
 
         recursive = ss.collect_files(self.root, recursive=True)
         self.assertEqual(
             [p.name for p in recursive],
-            [".NET Consultant notes.docx", "server.log", "top.txt", "nested.txt"],
+            dotfiles + ["server.log", "top.txt", "nested.txt"],
         )
 
     @unittest.skipIf(os.name == "nt", "POSIX dotfile convention")

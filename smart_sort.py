@@ -30,6 +30,7 @@ import math
 import multiprocessing as mp
 import os
 import re
+import shlex
 import shutil
 import stat
 import sys
@@ -39,23 +40,32 @@ import warnings
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, Sequence
 
 import numpy as np
 
-from sklearn.cluster import KMeans
+from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import silhouette_score
 
-from text_extract import ExtractionError, extract_text, extract_worker, is_heavy
+from file_safety import (
+    CLUSTER_DIR_RE,
+    STATE_DIR,
+    ApplyResult,
+    Move,
+    apply_moves,
+    assert_safe_path,
+    is_link_or_reparse,
+    resolve_root,
+    safe_relative_path,
+    sha256_file,
+    undo_manifest,
+)
+from text_extract import ExtractionError, extract_text, extract_worker, is_heavy, looks_like_text
 
 LOG = logging.getLogger("smart-sort")
-
-STATE_DIR = ".smart_sort"
-CLUSTER_DIR_RE = re.compile(r"^Cluster_\d+", re.IGNORECASE)
 
 DEFAULT_EXCLUDES: tuple[str, ...] = (
     ".git",
@@ -126,6 +136,13 @@ class Settings:
     timings: bool = False
     verbose_moves: bool = False
     excludes: tuple[str, ...] = DEFAULT_EXCLUDES
+    organize: bool = False
+    source: Path | None = None
+    match_threshold: float | None = None
+    match_margin: float | None = None
+    new_group_threshold: float | None = None
+    min_group_size: int = 2
+    save_plan: Path | None = None
 
 
 @dataclass
@@ -140,20 +157,6 @@ class Document:
 class Skip:
     path: Path
     reason: str
-
-
-@dataclass
-class Move:
-    src: Path
-    dst: Path
-    cluster: int
-
-
-@dataclass
-class ApplyResult:
-    moved: int
-    failed: int
-    manifest: Path | None
 
 
 class Stopwatch:
@@ -235,11 +238,12 @@ def collect_files(
     recursive: bool = False,
     excludes: Sequence[str] = DEFAULT_EXCLUDES,
 ) -> list[Path]:
-    """Return candidate files, deterministically ordered, symlinks excluded."""
+    """Return candidate files, deterministically ordered, links excluded."""
+    resolve_root(root)
     files: list[Path] = []
 
     def consider(path: Path) -> None:
-        if path.is_symlink() or not path.is_file() or is_hidden_or_system(path):
+        if is_link_or_reparse(path) or not path.is_file() or is_hidden_or_system(path):
             return
         if _matches_any(path.name, excludes):
             return
@@ -252,7 +256,7 @@ def collect_files(
                 for d in dirnames
                 if not _skip_dir(d, excludes)
                 and not is_hidden_or_system(Path(dirpath) / d)
-                and not (Path(dirpath) / d).is_symlink()
+                and not is_link_or_reparse(Path(dirpath) / d)
             )
             for name in sorted(filenames):
                 consider(Path(dirpath) / name)
@@ -378,7 +382,11 @@ def load_documents(
         text = " ".join((raw or "").split())
         chunks = split_chunks(text, max_chars, max_chunks)
         if not chunks or len(text) < min_chars:
-            skipped.append(Skip(path, "too little text"))
+            reason = (
+                "no extractable text (possibly a scanned PDF)"
+                if path.suffix.lower() == ".pdf" and not text else "too little text"
+            )
+            skipped.append(Skip(path, reason))
             continue
         documents.append(Document(path, text, chunks))
 
@@ -415,6 +423,13 @@ def _l2_normalize(matrix) -> np.ndarray:
     return array / norms
 
 
+def _valid_embedding(vector: np.ndarray) -> bool:
+    if vector.ndim != 1 or vector.size == 0 or not np.isfinite(vector).all():
+        return False
+    norm = float(np.linalg.norm(vector))
+    return math.isfinite(norm) and norm > 0
+
+
 class TfidfEmbedder:
     """Corpus-local fallback that needs no model download.
 
@@ -440,16 +455,18 @@ class TfidfEmbedder:
             ngram_range=(1, 2),
             max_features=self._max_features,
             sublinear_tf=True,
+            dtype=np.float32,
         )
         try:
             matrix = vectorizer.fit_transform(texts)
         except ValueError:
             # Empty vocabulary (e.g. only stop words): fall back to characters.
             vectorizer = TfidfVectorizer(
-                analyzer="char_wb", ngram_range=(3, 5), max_features=self._max_features
+                analyzer="char_wb", ngram_range=(3, 5), max_features=self._max_features,
+                dtype=np.float32,
             )
             matrix = vectorizer.fit_transform(texts)
-        return _l2_normalize(np.asarray(matrix.todense(), dtype=np.float32))
+        return _l2_normalize(matrix.toarray())
 
 
 class LlamaEmbedder:
@@ -475,13 +492,36 @@ class LlamaEmbedder:
             )
 
         try:
+            before = Path(model_path).stat()
+            fingerprint = sha256_file(Path(model_path))
+            after = Path(model_path).stat()
+            if (
+                not os.path.samestat(before, after)
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+            ):
+                raise EmbedderError(f"GGUF model changed while hashing: {model_path}")
+        except OSError as exc:
+            raise EmbedderError(f"Cannot fingerprint GGUF model {model_path}: {exc}") from exc
+
+        try:
             self._model = Llama(
                 model_path=str(model_path), embedding=True, n_ctx=n_ctx, verbose=False
             )
         except Exception as exc:  # pragma: no cover - depends on model file
             raise EmbedderError(f"Failed to load GGUF model {model_path}: {exc}") from exc
 
-        self.name = f"gguf:{Path(model_path).name}:ctx{n_ctx}"
+        try:
+            loaded = Path(model_path).stat()
+        except OSError as exc:
+            raise EmbedderError(f"Cannot verify GGUF model {model_path}: {exc}") from exc
+        if (
+            not os.path.samestat(after, loaded)
+            or after.st_size != loaded.st_size
+            or after.st_mtime_ns != loaded.st_mtime_ns
+        ):
+            raise EmbedderError(f"GGUF model changed while loading: {model_path}")
+        self.name = f"gguf:{Path(model_path).name}:{fingerprint}:ctx{n_ctx}"
 
     def embed_corpus(self, texts: Sequence[str]) -> np.ndarray:
         vectors: list[list[float]] = []
@@ -588,9 +628,15 @@ class SentenceTransformerEmbedder:
             resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
 
         if dtype == "auto":
-            resolved_dtype = (
-                torch.bfloat16 if resolved_device.startswith("cuda") else torch.float32
-            )
+            if resolved_device.startswith("cuda"):
+                try:
+                    with torch.cuda.device(resolved_device):
+                        supports_bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
+                except (RuntimeError, ValueError) as exc:
+                    raise EmbedderError(f"Cannot inspect CUDA device {resolved_device}: {exc}") from exc
+                resolved_dtype = torch.bfloat16 if supports_bf16 else torch.float32
+            else:
+                resolved_dtype = torch.float32
         else:
             dtypes = {
                 "bf16": torch.bfloat16,
@@ -630,7 +676,22 @@ class SentenceTransformerEmbedder:
         self.media_kinds = frozenset(media)
         dtype_name = str(resolved_dtype).replace("torch.", "")
         prompt_name = self._prompt_name or "none"
-        self.name = f"st:{model_name}:{resolved_device}:{dtype_name}:{prompt_name}"
+        modules = list(self._model.children())
+        first = modules[0] if modules else None
+        config = getattr(getattr(first, "auto_model", None), "config", None)
+        revision = getattr(config, "_commit_hash", None)
+        self.cacheable = (
+            not Path(model_name).exists()
+            and isinstance(revision, str)
+            and re.fullmatch(r"[0-9a-f]{40,64}", revision) is not None
+        )
+        if not self.cacheable:
+            LOG.warning(
+                "Embedding cache disabled for %s: an immutable remote model revision "
+                "could not be verified.", model_name,
+            )
+        cache_revision = revision if self.cacheable else "uncacheable"
+        self.name = f"st:{model_name}:{cache_revision}:{resolved_device}:{dtype_name}:{prompt_name}"
 
     def _encode(self, inputs, **kwargs) -> np.ndarray:
         vectors = self._model.encode(
@@ -714,6 +775,8 @@ class EmbeddingCache:
     def __init__(self, path: Path, identity: dict) -> None:
         self.path = path
         self.identity = identity
+        self.root = resolve_root(path.parent.parent)
+        assert_safe_path(self.root, self.path, allow_missing=True)
         self._vectors: dict[str, np.ndarray] = {}
         if path.exists():
             self._load()
@@ -737,23 +800,50 @@ class EmbeddingCache:
     def put(self, key: str, vector: np.ndarray) -> None:
         self._vectors[key] = np.asarray(vector, dtype=np.float32)
 
+    def discard(self, key: str) -> None:
+        self._vectors.pop(key, None)
+
     def save(self) -> None:
         if not self._vectors:
             return
+        assert_safe_path(self.root, self.path, allow_missing=True)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp.npz")
+        assert_safe_path(self.root, self.path.parent)
         payload = {"__meta__": np.array([json.dumps(self.identity)])}
         payload.update(self._vectors)
-        np.savez_compressed(temporary, **payload)
-        os.replace(temporary, self.path)
+        temporary: Path | None = None
+        created: os.stat_result | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w+b", prefix=".embeddings-", suffix=".npz",
+                dir=self.path.parent, delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                created = os.fstat(handle.fileno())
+                np.savez_compressed(handle, **payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            assert_safe_path(self.root, temporary)
+            assert_safe_path(self.root, self.path, allow_missing=True)
+            os.replace(temporary, self.path)
+        finally:
+            if temporary is not None and created is not None and temporary.exists():
+                assert_safe_path(self.root, temporary)
+                if os.path.samestat(created, temporary.stat()):
+                    temporary.unlink()
 
 
 def _media_cache_key(path: Path, kind: str) -> str:
-    try:
-        stats = path.stat()
-        return f"media:{kind}:{path.as_posix()}:{stats.st_size}:{stats.st_mtime_ns}"
-    except OSError:
-        return f"media:{kind}:{path.as_posix()}"
+    before = path.stat()
+    digest = sha256_file(path)
+    after = path.stat()
+    if (
+        not os.path.samestat(before, after)
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+    ):
+        raise OSError(f"Media file changed while hashing: {path}")
+    return f"media:{kind}:{digest}"
 
 
 def _embed_media_with_fallback(
@@ -829,6 +919,10 @@ def embed_documents(
     missing_chunks: list[int] = []
     for index, key in enumerate(keys):
         cached = cache.get(key) if cache else None
+        if cache is not None and cached is not None and not _valid_embedding(cached):
+            LOG.warning("Ignoring invalid cached text embedding")
+            cache.discard(key)
+            cached = None
         if cached is None:
             missing_chunks.append(index)
         else:
@@ -846,9 +940,10 @@ def embed_documents(
                 f"Embedder returned {len(fresh)} vectors for {len(missing_chunks)} chunks"
             )
         for index, vector in zip(missing_chunks, fresh):
-            chunk_vectors[index] = np.asarray(vector, dtype=np.float32)
-            if cache:
-                cache.put(keys[index], chunk_vectors[index])
+            fresh_vector = np.asarray(vector, dtype=np.float32)
+            chunk_vectors[index] = fresh_vector
+            if cache and _valid_embedding(fresh_vector):
+                cache.put(keys[index], fresh_vector)
         if cache:
             cache.save()
     elif keys:
@@ -856,7 +951,15 @@ def embed_documents(
 
     for index, positions in document_chunks.items():
         if positions:
-            vectors[index] = np.mean([chunk_vectors[p] for p in positions], axis=0)
+            parts: list[np.ndarray] = []
+            for position in positions:
+                part = chunk_vectors[position]
+                if part is None or not _valid_embedding(part):
+                    failures[index] = "non-finite, zero, or invalid text chunk embedding"
+                    break
+                parts.append(part)
+            else:
+                vectors[index] = np.mean(parts, axis=0)
         else:
             failures[index] = "no text chunks"
 
@@ -865,8 +968,20 @@ def embed_documents(
     missing_media: list[tuple[int, str]] = []
     for index in media_indices:
         document = documents[index]
-        key = _media_cache_key(document.path, document.kind)
-        cached = cache.get(key) if cache else None
+        if cache is None:
+            missing_media.append((index, ""))
+            continue
+        try:
+            key = _media_cache_key(document.path, document.kind)
+        except OSError as exc:
+            failures[index] = f"cannot fingerprint {document.kind}"
+            LOG.warning("Cannot fingerprint %s: %s", document.path.name, exc)
+            continue
+        cached = cache.get(key)
+        if cache is not None and cached is not None and not _valid_embedding(cached):
+            LOG.warning("Ignoring invalid cached embedding for %s", document.path.name)
+            cache.discard(key)
+            cached = None
         if cached is None:
             missing_media.append((index, key))
         else:
@@ -899,14 +1014,18 @@ def embed_documents(
                     failures[index] = f"{document.kind} could not be decoded"
                     continue
                 vectors[index] = embedded[document.path]
-                if cache:
+                if cache and _valid_embedding(vectors[index]):
                     cache.put(key, vectors[index])
             if cache:
                 cache.save()
-    elif media_indices:
+    elif media_indices and not any(index in failures for index in media_indices):
         LOG.info("All %d media files loaded from cache", len(media_indices))
 
     # ---- assemble --------------------------------------------------------- #
+    for index, vector in list(vectors.items()):
+        if not _valid_embedding(vector):
+            failures[index] = "non-finite, zero, or invalid embedding"
+            del vectors[index]
     dims = {vector.shape[0] for vector in vectors.values()}
     if len(dims) > 1:
         raise RuntimeError(f"Inconsistent embedding dimensions: {sorted(dims)}")
@@ -987,16 +1106,17 @@ def build_cluster_names(documents: Sequence[Document], labels: np.ndarray) -> di
                 ngram_range=(1, 2),
                 max_features=20000,
                 sublinear_tf=True,
-            )
-            matrix = np.asarray(
-                vectorizer.fit_transform([d.text[:4000] for d in documents]).todense(),
                 dtype=np.float32,
             )
+            matrix = vectorizer.fit_transform([d.text[:4000] for d in documents])
             vocabulary = np.array(vectorizer.get_feature_names_out())
             for cluster in np.unique(labels):
                 mask = labels == cluster
-                centroid = matrix[mask].mean(axis=0)
-                others = matrix[~mask].mean(axis=0) if (~mask).any() else np.zeros_like(centroid)
+                centroid = np.asarray(matrix[mask].mean(axis=0)).ravel()
+                others = (
+                    np.asarray(matrix[~mask].mean(axis=0)).ravel()
+                    if (~mask).any() else np.zeros_like(centroid)
+                )
                 scores = (centroid - others) * (centroid > 0)
                 top = np.argsort(scores)[-4:][::-1]
                 terms_by_cluster[int(cluster)] = [
@@ -1102,164 +1222,634 @@ def plan_moves(
     labels: np.ndarray,
     names: dict[int, str],
 ) -> list[Move]:
+    root = resolve_root(root)
     moves: list[Move] = []
     used: set[str] = set()
 
     for document, label in zip(documents, labels):
         cluster = int(label)
-        destination = _unique_destination(root / names[cluster], document.path.name, used)
+        directory = assert_safe_path(root, root / names[cluster], allow_missing=True)
+        destination = _unique_destination(directory, document.path.name, used)
         used.add(str(destination).casefold())
         moves.append(Move(document.path, destination, cluster))
 
     return moves
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+# --------------------------------------------------------------------------- #
+# Opt-in organizing and reviewed plans
+# --------------------------------------------------------------------------- #
 
 
-def apply_moves(root: Path, moves: Sequence[Move], metadata: dict) -> ApplyResult:
-    root = root.resolve()
-    state_dir = root / STATE_DIR
-    state_dir.mkdir(parents=True, exist_ok=True)
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    manifest = state_dir / f"manifest-{stamp}.jsonl"
-    if manifest.exists():
-        manifest = state_dir / f"manifest-{stamp}-{os.getpid()}.jsonl"
-
-    moved = 0
-    failed = 0
-    with manifest.open("w", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "type": "header",
-                    "version": 1,
-                    "created": datetime.now(timezone.utc).isoformat(),
-                    "root": str(root),
-                    **metadata,
-                }
-            )
-            + "\n"
-        )
-        handle.flush()
-
-        for move in moves:
-            try:
-                if move.dst.exists():
-                    raise OSError(f"destination already exists: {move.dst}")
-                size = move.src.stat().st_size
-                digest = sha256_file(move.src)
-                move.dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(move.src), str(move.dst))
-                if not move.dst.exists():
-                    raise OSError("destination missing after move")
-                handle.write(
-                    json.dumps(
-                        {
-                            "type": "move",
-                            "src": move.src.relative_to(root).as_posix(),
-                            "dst": move.dst.relative_to(root).as_posix(),
-                            "size": size,
-                            "sha256": digest,
-                        }
-                    )
-                    + "\n"
-                )
-                handle.flush()
-                moved += 1
-            except OSError as exc:
-                LOG.error("Could not move %s: %s", move.src, exc)
-                failed += 1
-
-    if moved == 0:
-        manifest.unlink(missing_ok=True)
-        return ApplyResult(0, failed, None)
-
-    return ApplyResult(moved, failed, manifest)
+_REFERENCE_SAMPLE_LIMIT = 25
+_NOVEL_GROUP_LIMIT = 1000
 
 
-def _restored_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    stem, suffix, parent = path.stem, path.suffix, path.parent
-    candidate = parent / f"{stem} (restored){suffix}"
-    counter = 2
-    while candidate.exists():
-        candidate = parent / f"{stem} (restored {counter}){suffix}"
-        counter += 1
-    return candidate
+@dataclass
+class _OrganizationInputs:
+    source: Path
+    incoming: list[Path]
+    references: dict[Path, list[Path]]
+    reference_totals: dict[Path, int]
 
 
-def _prune_empty_cluster_dirs(root: Path, directories: Sequence[Path]) -> None:
-    for directory in sorted(set(directories), key=lambda p: len(p.parts), reverse=True):
-        current = directory
-        while current != root and current.parent != current:
-            if not CLUSTER_DIR_RE.match(current.name):
-                break
-            try:
-                current.rmdir()
-            except OSError:
-                break
-            current = current.parent
+@dataclass
+class _OrganizationDecision:
+    source: Path
+    kind: str
+    folder: Path | None
+    score: float | None
+    reason: str
+    destination: Path | None = None
 
 
-def undo_manifest(manifest: Path, dry_run: bool = True) -> tuple[int, int]:
-    """Move files recorded in a manifest back to their original paths."""
-    header: dict | None = None
-    entries: list[dict] = []
-    with manifest.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
+def _organization_inputs(
+    root: Path,
+    source: Path | None,
+    recursive: bool,
+    excludes: Sequence[str],
+    plan_path: Path | None,
+) -> _OrganizationInputs:
+    if source is None:
+        if recursive:
+            raise ValueError("--organize --recursive requires an explicit --source folder")
+        source_root = root
+        source_top = None
+    else:
+        source = source.expanduser()
+        source_root = assert_safe_path(root, source if source.is_absolute() else root / source)
+        if source_root == root or not source_root.is_dir():
+            raise ValueError("--source must be a folder inside, but not equal to, the root")
+        current = root
+        for part in source_root.relative_to(root).parts:
+            current = current / part
+            if _skip_dir(part, excludes) or is_hidden_or_system(current):
+                raise ValueError(f"--source contains an excluded or hidden folder: {current}")
+        source_top = source_root.relative_to(root).parts[0].casefold()
+
+    incoming = [
+        path for path in collect_files(source_root, recursive, excludes) if path != plan_path
+    ]
+    references: dict[Path, list[Path]] = {}
+    totals: dict[Path, int] = {}
+    for folder in sorted(root.iterdir()):
+        if is_link_or_reparse(folder) or not folder.is_dir():
+            continue
+        if (
+            folder.name.startswith(".")
+            or folder.name.casefold() == source_top
+            or _matches_any(folder.name, excludes)
+            or is_hidden_or_system(folder)
+        ):
+            continue
+        files = [
+            path for path in collect_files(folder, recursive=True, excludes=excludes)
+            if path != plan_path
+        ]
+        references[folder] = files[:_REFERENCE_SAMPLE_LIMIT]
+        totals[folder] = len(files)
+    return _OrganizationInputs(source_root, incoming, references, totals)
+
+
+def _organization_snapshot(
+    root: Path, inputs: _OrganizationInputs, hash_paths: set[Path]
+) -> dict:
+    def fingerprint(path: Path) -> dict:
+        assert_safe_path(root, path)
+        before = path.stat()
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"Input is not a regular file: {path}")
+        digest = sha256_file(path) if path in hash_paths else None
+        assert_safe_path(root, path)
+        after = path.stat()
+        if (
+            not os.path.samestat(before, after)
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+        ):
+            raise OSError(f"Input changed while preparing the plan: {path}")
+        return {
+            "path": path.relative_to(root).as_posix(),
+            "size": after.st_size,
+            "mtime_ns": after.st_mtime_ns,
+            "sha256": digest,
+        }
+
+    return {
+        "incoming": [fingerprint(path) for path in inputs.incoming],
+        "categories": [
+            {
+                "folder": folder.relative_to(root).as_posix(),
+                "total": inputs.reference_totals[folder],
+                "files": [fingerprint(path) for path in files],
+            }
+            for folder, files in inputs.references.items()
+        ],
+    }
+
+
+def _organization_hashes(
+    root: Path, files: Sequence[Path], media_kinds: Sequence[str]
+) -> tuple[dict[Path, str], list[Skip]]:
+    fingerprints: dict[Path, str] = {}
+    skipped: list[Skip] = []
+    for path in files:
+        try:
+            assert_safe_path(root, path)
+            kind = media_kind(path)
+            if kind is not None and kind not in media_kinds:
                 continue
-            record = json.loads(line)
-            if record.get("type") == "header":
-                header = record
-            elif record.get("type") == "move":
-                entries.append(record)
+            if kind is None and not is_heavy(path):
+                with path.open("rb") as handle:
+                    if not looks_like_text(handle.read(8192)):
+                        continue
+            before = path.stat()
+            digest = sha256_file(path)
+            assert_safe_path(root, path)
+            after = path.stat()
+            if (
+                not os.path.samestat(before, after)
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+            ):
+                raise OSError(f"File changed while hashing: {path}")
+            fingerprints[path] = digest
+        except OSError as exc:
+            LOG.warning("Cannot fingerprint %s: %s", path.name, exc)
+            skipped.append(Skip(path, "cannot fingerprint file"))
+    return fingerprints, skipped
 
-    if header is None:
-        raise ValueError(f"{manifest} is not a Smart-Sort manifest (no header)")
 
-    root = Path(header["root"])
-    restored = 0
-    failed = 0
-    touched: list[Path] = []
+def _snapshot_hashes(snapshot: dict) -> dict[str, str]:
+    records = list(snapshot["incoming"])
+    for category in snapshot["categories"]:
+        records.extend(category["files"])
+    return {
+        record["path"]: record["sha256"]
+        for record in records if record["sha256"] is not None
+    }
 
-    for record in reversed(entries):
-        source = root / record["src"]
-        destination = root / record["dst"]
 
-        if not destination.exists():
-            LOG.warning("Missing, cannot undo: %s", record["dst"])
-            failed += 1
+def _snapshot_metadata(snapshot: dict) -> tuple:
+    def items(records: list[dict]) -> tuple:
+        return tuple((record["path"], record["size"], record["mtime_ns"]) for record in records)
+
+    return (
+        items(snapshot["incoming"]),
+        tuple(
+            (category["folder"], category["total"], items(category["files"]))
+            for category in snapshot["categories"]
+        ),
+    )
+
+
+def _organization_decisions(
+    root: Path,
+    inputs: _OrganizationInputs,
+    documents: Sequence[Document],
+    matrix: np.ndarray,
+    skipped: Sequence[Skip],
+    embedder: Embedder,
+    settings: Settings,
+) -> list[_OrganizationDecision]:
+    vectors: dict[Path, np.ndarray] = {}
+    reasons = {skip.path: skip.reason for skip in skipped}
+    for document, vector in zip(documents, matrix):
+        if not _valid_embedding(vector):
+            reasons[document.path] = "non-finite or zero embedding"
+        else:
+            vectors[document.path] = vector
+
+    profiles: dict[Path, tuple[np.ndarray, np.ndarray]] = {}
+    for folder, files in inputs.references.items():
+        rows = [vectors[path] for path in files if path in vectors]
+        if not rows:
+            LOG.info("Category %s has no usable reference files", folder.name)
             continue
-        expected = record.get("sha256")
-        if expected and sha256_file(destination) != expected:
-            LOG.warning("Checksum changed, refusing to move: %s", record["dst"])
-            failed += 1
+        samples = _l2_normalize(np.vstack(rows))
+        centroid = _l2_normalize(samples.mean(axis=0))[0]
+        profiles[folder] = (centroid, samples)
+        LOG.info("Category %s: %d reference files", folder.name, len(rows))
+
+    by_path = {document.path: document for document in documents}
+    decisions: dict[Path, _OrganizationDecision] = {}
+    unmatched: list[Path] = []
+    for path in inputs.incoming:
+        vector = vectors.get(path)
+        if vector is None:
+            decisions[path] = _OrganizationDecision(
+                path, "review", None, None, reasons.get(path, "no usable embedding")
+            )
             continue
 
-        target = _restored_path(source)
-        if dry_run:
-            print(f"  would restore {record['dst']} -> {target.relative_to(root).as_posix()}")
-            restored += 1
+        scores: list[tuple[float, Path]] = []
+        for folder, (centroid, samples) in profiles.items():
+            score = max(float(centroid @ vector), float(np.max(samples @ vector)))
+            scores.append((float(np.clip(score, -1.0, 1.0)), folder))
+        scores.sort(key=lambda item: (-item[0], item[1].name.casefold()))
+        if not scores:
+            unmatched.append(path)
             continue
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(destination), str(target))
-        touched.append(destination.parent)
-        restored += 1
+        score, folder = scores[0]
+        if settings.match_threshold is None or settings.match_margin is None:
+            decisions[path] = _OrganizationDecision(
+                path, "review", None, score,
+                f"nearest folder is {folder.name}; matching thresholds are not configured",
+            )
+        elif score >= settings.match_threshold:
+            margin = score - scores[1][0] if len(scores) > 1 else None
+            if margin is not None and margin < settings.match_margin:
+                decisions[path] = _OrganizationDecision(
+                    path, "review", None, score,
+                    f"ambiguous match between {folder.name} and {scores[1][1].name}",
+                )
+            else:
+                decisions[path] = _OrganizationDecision(
+                    path, "existing", folder, score, "matches existing folder"
+                )
+        else:
+            unmatched.append(path)
 
-    if not dry_run:
-        _prune_empty_cluster_dirs(root, touched)
+    if (
+        settings.new_group_threshold is not None
+        and len(unmatched) >= settings.min_group_size
+        and len(unmatched) <= _NOVEL_GROUP_LIMIT
+    ):
+        novel_documents = [by_path[path] for path in unmatched]
+        novel_matrix = _l2_normalize(np.vstack([vectors[path] for path in unmatched]))
+        similarity = np.clip(novel_matrix @ novel_matrix.T, -1.0, 1.0)
+        distances = np.maximum(0.0, 1.0 - similarity)
+        np.fill_diagonal(distances, 0.0)
+        labels = AgglomerativeClustering(
+            n_clusters=None,
+            metric="precomputed",
+            linkage="complete",
+            distance_threshold=float(np.nextafter(1.0 - settings.new_group_threshold, np.inf)),
+            compute_full_tree=True,
+        ).fit_predict(distances)
+        names = (
+            build_cluster_names(novel_documents, labels)
+            if settings.label_clusters
+            else {int(label): f"Cluster_{int(label) + 1}" for label in np.unique(labels)}
+        )
+        if settings.label_clusters:
+            names = label_media_clusters(novel_documents, labels, novel_matrix, embedder, names)
+        used_names = {path.name.casefold() for path in root.iterdir()}
+        for label in sorted(np.unique(labels)):
+            positions = np.flatnonzero(labels == label)
+            if len(positions) < settings.min_group_size:
+                continue
+            cohesion = float(np.min(similarity[np.ix_(positions, positions)]))
+            if cohesion < settings.new_group_threshold:
+                continue
+            base = names[int(label)]
+            name = base
+            suffix = 2
+            while name.casefold() in used_names:
+                name = f"{base}_{suffix}"
+                suffix += 1
+            used_names.add(name.casefold())
+            for position in positions:
+                path = unmatched[int(position)]
+                decisions[path] = _OrganizationDecision(
+                    path, "new", root / name, cohesion, "cohesive unmatched group"
+                )
+    elif len(unmatched) > _NOVEL_GROUP_LIMIT:
+        LOG.warning(
+            "Too many unmatched files for bounded grouping (%d > %d); review them manually",
+            len(unmatched),
+            _NOVEL_GROUP_LIMIT,
+        )
 
-    return restored, failed
+    for path in unmatched:
+        if path not in decisions:
+            reason = (
+                "new-group threshold is not configured"
+                if settings.new_group_threshold is None
+                else "no sufficiently cohesive new group"
+            )
+            decisions[path] = _OrganizationDecision(path, "review", None, None, reason)
+
+    used_destinations: set[str] = set()
+    ordered = [decisions[path] for path in inputs.incoming]
+    for decision in ordered:
+        if decision.folder is not None:
+            folder = assert_safe_path(root, decision.folder, allow_missing=True)
+            decision.destination = _unique_destination(folder, decision.source.name, used_destinations)
+            used_destinations.add(str(decision.destination).casefold())
+    return ordered
+
+
+def _organize_plan(
+    root: Path,
+    inputs: _OrganizationInputs,
+    snapshot: dict,
+    decisions: Sequence[_OrganizationDecision],
+    embedder: Embedder,
+    settings: Settings,
+) -> dict:
+    return {
+        "type": "smart-sort-plan",
+        "version": 1,
+        "root": str(root),
+        "source": (
+            inputs.source.relative_to(root).as_posix()
+            if settings.source is not None else None
+        ),
+        "recursive": settings.recursive,
+        "excludes": list(settings.excludes),
+        "backend": embedder.name,
+        "thresholds": {
+            "match": settings.match_threshold,
+            "margin": settings.match_margin,
+            "new_group": settings.new_group_threshold,
+            "min_group_size": settings.min_group_size,
+        },
+        "inputs": snapshot,
+        "decisions": [
+            {
+                "source": decision.source.relative_to(root).as_posix(),
+                "destination": (
+                    decision.destination.relative_to(root).as_posix()
+                    if decision.destination is not None else None
+                ),
+                "classification": decision.kind,
+                "score": decision.score,
+                "reason": decision.reason,
+                "approved": False,
+            }
+            for decision in decisions
+        ],
+    }
+
+
+def _print_organization(root: Path, decisions: Sequence[_OrganizationDecision]) -> None:
+    counts = Counter(decision.kind for decision in decisions)
+    print(
+        f"{len(decisions)} incoming files: {counts['existing']} existing-folder suggestions, "
+        f"{counts['new']} new-folder suggestions, {counts['review']} need review"
+    )
+    for decision in decisions:
+        source = decision.source.relative_to(root).as_posix()
+        destination = (
+            decision.destination.relative_to(root).as_posix()
+            if decision.destination is not None else "(needs review)"
+        )
+        score = f", score {decision.score:.3f}" if decision.score is not None else ""
+        print(f"  [{decision.kind}] {source} -> {destination}{score}: {decision.reason}")
+
+
+def _windows_reserved_component(name: str) -> bool:
+    stem = name.split(".", 1)[0].rstrip(" ").upper()
+    reserved = {"CON", "PRN", "AUX", "NUL"}
+    reserved.update(f"COM{number}" for number in range(1, 10))
+    reserved.update(f"LPT{number}" for number in range(1, 10))
+    return (
+        stem in reserved
+        or name.rstrip(" .") != name
+        or re.search(r'[<>:"/\\|?*\x00-\x1f]', name) is not None
+    )
+
+
+def run_organize(settings: Settings, root: Path, embedder: Embedder | None = None) -> int:
+    if settings.apply:
+        LOG.error("Organizing suggestions require a saved, manually approved plan.")
+        return 1
+    watch = Stopwatch()
+    plan_path = (
+        Path(os.path.abspath(os.fspath(settings.save_plan.expanduser())))
+        if settings.save_plan is not None else None
+    )
+    try:
+        if (settings.match_threshold is None) != (settings.match_margin is None):
+            raise ValueError("Match threshold and margin must be supplied together")
+        for value, name, upper in (
+            (settings.match_threshold, "match threshold", 1.0),
+            (settings.match_margin, "match margin", 2.0),
+            (settings.new_group_threshold, "new-group threshold", 1.0),
+        ):
+            if value is not None and (not math.isfinite(value) or not 0 <= value <= upper):
+                raise ValueError(f"{name} must be a finite number between 0 and {upper:g}")
+        if settings.min_group_size < 2:
+            raise ValueError("Minimum group size must be at least 2")
+        with watch.phase("collect"):
+            inputs = _organization_inputs(
+                root, settings.source, settings.recursive, settings.excludes, plan_path
+            )
+            if not inputs.incoming:
+                LOG.error("No eligible incoming files found in %s", inputs.source)
+                return 1
+        with watch.phase("model"):
+            embedder = embedder or build_embedder(settings)
+        media_kinds = tuple(
+            kind for kind in settings.media
+            if kind in getattr(embedder, "media_kinds", frozenset())
+        )
+        with watch.phase("fingerprint"):
+            inputs = _organization_inputs(
+                root, settings.source, settings.recursive, settings.excludes, plan_path
+            )
+            if not inputs.incoming:
+                raise OSError(f"No eligible incoming files remain in {inputs.source}")
+            before = _organization_snapshot(root, inputs, set())
+            files = inputs.incoming + [
+                path for paths in inputs.references.values() for path in paths
+            ]
+            fingerprints, fingerprint_skips = _organization_hashes(root, files, media_kinds)
+            failed_paths = {skip.path for skip in fingerprint_skips}
+        with watch.phase("extract"):
+            documents, skipped = load_documents(
+                [path for path in files if path not in failed_paths],
+                settings.max_chars, settings.max_chunks, settings.max_pdf_pages,
+                settings.min_chars, settings.jobs, media_kinds,
+            )
+            skipped.extend(fingerprint_skips)
+        hash_paths = set(fingerprints)
+        with watch.phase("embed"):
+            matrix, documents, embed_skips = embed_documents(
+                documents, embedder, root / STATE_DIR if settings.use_cache else None,
+                settings.use_cache,
+            )
+            skipped.extend(embed_skips)
+        with watch.phase("verify"):
+            current = _organization_inputs(
+                root, settings.source, settings.recursive, settings.excludes, plan_path
+            )
+            snapshot = _organization_snapshot(root, current, hash_paths)
+            if _snapshot_metadata(before) != _snapshot_metadata(snapshot):
+                raise OSError("Inputs changed during preview; run it again")
+            expected_hashes = {
+                path.relative_to(root).as_posix(): digest for path, digest in fingerprints.items()
+            }
+            if _snapshot_hashes(snapshot) != expected_hashes:
+                raise OSError("Input content changed during preview; run it again")
+        with watch.phase("cluster"):
+            decisions = _organization_decisions(
+                root, current, documents, matrix, skipped, embedder, settings
+            )
+        plan = _organize_plan(root, current, snapshot, decisions, embedder, settings)
+        if plan_path is not None:
+            if plan_path.is_relative_to(root):
+                assert_safe_path(root, plan_path, allow_missing=True)
+            with plan_path.open("x", encoding="utf-8") as handle:
+                json.dump(plan, handle, indent=2, ensure_ascii=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+    except (OSError, ValueError, RuntimeError, EmbedderError) as exc:
+        LOG.error("Could not prepare organizing preview: %s", exc)
+        return 1
+
+    _print_organization(root, decisions)
+    if plan_path is not None:
+        print(f"\nPlan saved: {plan_path}")
+        print("Review destinations and set approved to true for each file to move.")
+    if settings.timings:
+        watch.print_summary()
+    print("Preview only: no files were moved; Smart-Sort has not benchmarked these thresholds.")
+    return 0
+
+
+def apply_organize_plan(root: Path, plan_path: Path, apply: bool = False) -> int:
+    try:
+        root = resolve_root(root)
+        plan_path = Path(os.path.abspath(os.fspath(plan_path.expanduser())))
+        if is_link_or_reparse(plan_path):
+            raise ValueError(f"Plan is missing or is a link: {plan_path}")
+        if plan_path.is_relative_to(root):
+            assert_safe_path(root, plan_path)
+        with plan_path.open("rb") as handle:
+            plan_bytes = handle.read()
+        plan_digest = hashlib.sha256(plan_bytes).hexdigest()
+        plan = json.loads(plan_bytes)
+        if not isinstance(plan, dict) or plan.get("type") != "smart-sort-plan" or plan.get("version") != 1:
+            raise ValueError("Not a supported Smart-Sort organizing plan")
+        plan_root = plan.get("root")
+        if not isinstance(plan_root, str) or not Path(plan_root).is_absolute():
+            raise ValueError("Plan root must be an absolute path")
+        if not os.path.samefile(root, resolve_root(Path(plan_root))):
+            raise ValueError("Plan belongs to a different root")
+        source_value = plan.get("source")
+        if source_value is None:
+            source = None
+        else:
+            source = safe_relative_path(root, source_value)
+        recursive = plan.get("recursive")
+        excludes = plan.get("excludes")
+        snapshot = plan.get("inputs")
+        decisions = plan.get("decisions")
+        if (
+            not isinstance(recursive, bool)
+            or not isinstance(excludes, list)
+            or not all(isinstance(pattern, str) for pattern in excludes)
+            or not isinstance(snapshot, dict)
+            or not isinstance(decisions, list)
+        ):
+            raise ValueError("Plan has invalid discovery or decision data")
+        excludes = list(DEFAULT_EXCLUDES) + excludes
+        incoming_records = snapshot.get("incoming")
+        categories = snapshot.get("categories")
+        if not isinstance(incoming_records, list) or not isinstance(categories, list):
+            raise ValueError("Plan has invalid input snapshots")
+        records = list(incoming_records)
+        for category in categories:
+            if not isinstance(category, dict) or not isinstance(category.get("files"), list):
+                raise ValueError("Plan has invalid category snapshots")
+            records.extend(category["files"])
+        hash_paths: set[Path] = set()
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("Plan has an invalid input record")
+            path = safe_relative_path(root, record.get("path"))
+            digest = record.get("sha256")
+            if digest is not None:
+                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    raise ValueError("Plan has an invalid input checksum")
+                hash_paths.add(path)
+
+        def verify_inputs() -> None:
+            if is_link_or_reparse(plan_path) or sha256_file(plan_path) != plan_digest:
+                raise ValueError("Plan changed while being applied; review it again")
+            if plan_path.is_relative_to(root):
+                assert_safe_path(root, plan_path)
+            current = _organization_inputs(root, source, recursive, excludes, plan_path)
+            actual = _organization_snapshot(root, current, hash_paths)
+            if actual != snapshot:
+                raise ValueError("Inputs or category profiles changed; create a new preview")
+
+        verify_inputs()
+        incoming_by_path = {
+            record["path"]: record for record in incoming_records if isinstance(record, dict)
+        }
+        moves: list[Move] = []
+        used_sources: set[str] = set()
+        used_destinations: set[str] = set()
+        for decision in decisions:
+            if not isinstance(decision, dict) or not isinstance(decision.get("approved"), bool):
+                raise ValueError("Every decision must have a boolean approved field")
+            source_path = safe_relative_path(root, decision.get("source"))
+            source_key = source_path.relative_to(root).as_posix()
+            if source_key in used_sources or source_key not in incoming_by_path:
+                raise ValueError(f"Plan has a duplicate or unknown source: {source_key}")
+            used_sources.add(source_key)
+            if not decision["approved"]:
+                continue
+            record = incoming_by_path[source_key]
+            digest, size = record.get("sha256"), record.get("size")
+            if not isinstance(digest, str) or not isinstance(size, int):
+                raise ValueError(f"Approved file has no usable fingerprint: {source_key}")
+            destination = safe_relative_path(root, decision.get("destination"))
+            relative = destination.relative_to(root)
+            if (
+                len(relative.parts) < 2
+                or (source is not None and relative.parts[0].casefold() == source.relative_to(root).parts[0].casefold())
+                or (os.name == "nt" and any(_windows_reserved_component(part) for part in relative.parts))
+            ):
+                raise ValueError(f"Destination is not an eligible category: {destination}")
+            parent = root
+            for part in relative.parts[:-1]:
+                parent = parent / part
+                if (
+                    part.startswith(".")
+                    or _matches_any(part, excludes)
+                    or (parent.exists() and is_hidden_or_system(parent))
+                ):
+                    raise ValueError(f"Destination contains an excluded or hidden folder: {parent}")
+            if destination.name.startswith("~$") or (
+                os.name != "nt" and destination.name.startswith(".")
+            ):
+                raise ValueError(f"Destination is a hidden or lock file: {destination}")
+            destination_key = str(destination).casefold()
+            if destination_key in used_destinations or os.path.lexists(destination):
+                raise ValueError(f"Destination already exists or is duplicated: {destination}")
+            used_destinations.add(destination_key)
+            moves.append(Move(source_path, destination, 0, digest, size))
+
+        print(f"{len(moves)} approved moves")
+        for move in moves:
+            print(f"  {move.src.relative_to(root).as_posix()} -> {move.dst.relative_to(root).as_posix()}")
+        if not apply:
+            print("Dry run: no files were moved. Add --apply to execute the reviewed plan.")
+            return 0
+        if not moves:
+            raise ValueError("No files were approved in the plan")
+        result = apply_moves(
+            root, moves,
+            {"backend": plan.get("backend"), "plan": str(plan_path), "files": len(moves)},
+            preflight=verify_inputs,
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        LOG.error("Could not apply organizing plan: %s", exc)
+        return 1
+
+    print(f"Moved {result.moved} files.")
+    if result.failed:
+        print(f"Failed: {result.failed} files; inspect the manifest for recovery.")
+    if result.manifest is not None:
+        print(f"Manifest: {result.manifest}")
+        print(f"Undo or recover with: {_undo_command(result.manifest)}")
+    return 0 if result.failed == 0 else 1
 
 
 # --------------------------------------------------------------------------- #
@@ -1288,8 +1878,22 @@ def _print_summary(root: Path, moves: Sequence[Move], settings: Settings) -> Non
             print(f"      {sample}")
 
 
+def _undo_command(manifest: Path) -> str:
+    arguments = [sys.executable, str(Path(__file__).resolve()), "--undo", str(manifest), "--apply"]
+    if os.name == "nt":
+        quoted = ["'" + argument.replace("'", "''") + "'" for argument in arguments]
+        return "& " + " ".join(quoted)
+    return shlex.join(arguments)
+
+
 def run(settings: Settings, embedder: Embedder | None = None) -> int:
-    root = settings.root.resolve()
+    try:
+        root = resolve_root(settings.root)
+    except (OSError, ValueError) as exc:
+        LOG.error("Unsafe or inaccessible root: %s", exc)
+        return 1
+    if settings.organize:
+        return run_organize(settings, root, embedder)
     watch = Stopwatch()
 
     with watch.phase("collect"):
@@ -1326,7 +1930,7 @@ def run(settings: Settings, embedder: Embedder | None = None) -> int:
                 documents, embedder, cache_dir, settings.use_cache
             )
             skipped.extend(media_skips)
-    except (RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         LOG.error("Embedding failed: %s", exc)
         return 1
 
@@ -1357,7 +1961,11 @@ def run(settings: Settings, embedder: Embedder | None = None) -> int:
         )
         if settings.label_clusters:
             names = label_media_clusters(documents, labels, matrix, embedder, names)
-        moves = plan_moves(root, documents, labels, names)
+        try:
+            moves = plan_moves(root, documents, labels, names)
+        except (OSError, ValueError) as exc:
+            LOG.error("Cannot plan moves safely: %s", exc)
+            return 1
 
     _print_summary(root, moves, settings)
 
@@ -1374,29 +1982,32 @@ def run(settings: Settings, embedder: Embedder | None = None) -> int:
         print("\nDry run: no files were moved. Re-run with --apply to execute.")
         return 0
 
-    with watch.phase("apply"):
-        result = apply_moves(
-            root,
-            moves,
-            {
-                "backend": embedder.name,
-                "k": k,
-                "files": len(documents),
-                "media": ",".join(media_kinds),
-                "seed": settings.seed,
-            },
-        )
+    try:
+        with watch.phase("apply"):
+            result = apply_moves(
+                root,
+                moves,
+                {
+                    "backend": embedder.name,
+                    "k": k,
+                    "files": len(documents),
+                    "media": ",".join(media_kinds),
+                    "seed": settings.seed,
+                },
+            )
+    except (OSError, ValueError) as exc:
+        LOG.error("Could not start the applied run: %s", exc)
+        return 1
     if result.manifest is None:
-        LOG.error("No files were moved (%d failed).", result.failed)
+        LOG.error("Could not create an undo manifest (%d failed).", result.failed)
         return 1
 
-    relative_manifest = result.manifest.relative_to(root).as_posix()
     folder_word = "folder" if len(names) == 1 else "folders"
     print(f"\nMoved {result.moved} files into {len(names)} {folder_word}.")
     if result.failed:
-        print(f"Failed: {result.failed} files (see log above).")
-    print(f"Manifest: {relative_manifest}")
-    print(f'Undo with: python smart_sort.py --undo "{relative_manifest}" --apply')
+        print(f"Failed: {result.failed} files; inspect the manifest for recovery.")
+    print(f"Manifest: {result.manifest}")
+    print(f"Undo or recover with: {_undo_command(result.manifest)}")
     if settings.timings:
         watch.print_summary()
     return 0 if result.failed == 0 else 1
@@ -1419,6 +2030,8 @@ def build_parser() -> argparse.ArgumentParser:
             '  smart_sort.py . --backend tfidf --k 6 --recursive\n'
             '  smart_sort.py "D:\\Media" --backend st --model unsloth/embeddinggemma-2\n'
             '  smart_sort.py --model models/embeddinggemma-2.gguf --apply "D:\\Docs"\n'
+            '  smart_sort.py "D:\\Docs" --organize --save-plan "D:\\Plans\\sort.json"\n'
+            '  smart_sort.py "D:\\Docs" --apply-plan "D:\\Plans\\sort.json" --apply\n'
             '  smart_sort.py --undo ".smart_sort/manifest-20250101-120000.jsonl" --apply\n'
         ),
     )
@@ -1428,10 +2041,52 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Actually move files. Without this flag the run is a dry run.",
     )
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--undo",
         metavar="MANIFEST",
         help="Reverse a previous run using its JSONL manifest (dry run unless --apply).",
+    )
+    modes.add_argument(
+        "--organize",
+        action="store_true",
+        help="Preview incoming files against existing folders and possible new groups.",
+    )
+    modes.add_argument(
+        "--apply-plan",
+        metavar="PLAN",
+        help="Preview or apply manually approved decisions from an organizing plan.",
+    )
+    parser.add_argument(
+        "--source",
+        type=Path,
+        help="Incoming folder inside the root for --organize (default: loose root files).",
+    )
+    parser.add_argument(
+        "--match-threshold",
+        type=float,
+        help="Explicit minimum cosine similarity for existing-folder suggestions.",
+    )
+    parser.add_argument(
+        "--match-margin",
+        type=float,
+        help="Explicit minimum score gap between the best two existing folders.",
+    )
+    parser.add_argument(
+        "--new-group-threshold",
+        type=float,
+        help="Explicit minimum pairwise cosine similarity for new-folder suggestions.",
+    )
+    parser.add_argument(
+        "--min-group-size",
+        type=int,
+        default=2,
+        help="Minimum files in a proposed new group (default: 2).",
+    )
+    parser.add_argument(
+        "--save-plan",
+        type=Path,
+        help="Save an organizing preview as a new JSON plan for manual review.",
     )
     parser.add_argument("--k", type=int, help="Number of clusters (default: automatic).")
     parser.add_argument(
@@ -1582,6 +2237,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    if not args.organize and (
+        args.source is not None
+        or args.match_threshold is not None
+        or args.match_margin is not None
+        or args.new_group_threshold is not None
+        or args.min_group_size != 2
+        or args.save_plan is not None
+    ):
+        parser.error("organizing thresholds, --source, and --save-plan require --organize")
+    if args.organize:
+        if args.apply:
+            parser.error("--organize is preview-only; review a saved plan and use --apply-plan")
+        if args.k is not None or args.auto_k:
+            parser.error("--k and --auto-k apply to clustering, not --organize")
+        if args.recursive and args.source is None:
+            parser.error("--organize --recursive requires --source")
+        if (args.match_threshold is None) != (args.match_margin is None):
+            parser.error("--match-threshold and --match-margin must be supplied together")
+        for value, name, upper in (
+            (args.match_threshold, "--match-threshold", 1.0),
+            (args.match_margin, "--match-margin", 2.0),
+            (args.new_group_threshold, "--new-group-threshold", 1.0),
+        ):
+            if value is not None and (not math.isfinite(value) or not 0 <= value <= upper):
+                parser.error(f"{name} must be a finite number between 0 and {upper:g}")
+        if args.min_group_size < 2:
+            parser.error("--min-group-size must be at least 2")
+
     if args.undo:
         manifest = Path(args.undo).expanduser()
         if not manifest.is_file():
@@ -1589,6 +2272,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         started = time.perf_counter()
         try:
             restored, failed = undo_manifest(manifest, dry_run=not args.apply)
+        except KeyboardInterrupt:
+            LOG.warning("Undo interrupted; use the same manifest to resume recovery.")
+            return 130
         except (OSError, ValueError) as exc:
             LOG.error("%s", exc)
             return 1
@@ -1610,6 +2296,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     root = Path(args.path).expanduser()
     if not root.is_dir():
         parser.error(f"not a directory: {root}")
+
+    if args.apply_plan:
+        started = time.perf_counter()
+        try:
+            result = apply_organize_plan(root, Path(args.apply_plan), apply=args.apply)
+        except KeyboardInterrupt:
+            LOG.warning("Interrupted; use the manifest under .smart_sort to recover the run.")
+            return 130
+        if args.timings:
+            print(f"\nTimings:\n  {'plan':<12} {time.perf_counter() - started:8.3f} s")
+        return result
 
     media = tuple(part.strip().lower() for part in args.media.split(",") if part.strip())
     unknown_media = set(media) - {"image", "audio", "video"}
@@ -1641,12 +2338,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         timings=args.timings,
         verbose_moves=bool(args.verbose),
         excludes=DEFAULT_EXCLUDES + tuple(args.exclude or ()),
+        organize=args.organize,
+        source=args.source,
+        match_threshold=args.match_threshold,
+        match_margin=args.match_margin,
+        new_group_threshold=args.new_group_threshold,
+        min_group_size=args.min_group_size,
+        save_plan=args.save_plan,
     )
 
     try:
         return run(settings)
     except KeyboardInterrupt:
-        LOG.warning("Interrupted before completion; any completed moves are in the manifest.")
+        LOG.warning("Interrupted; use the manifest under .smart_sort to recover the run.")
         return 130
 
 
